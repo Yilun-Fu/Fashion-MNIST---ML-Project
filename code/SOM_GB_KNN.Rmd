@@ -1,0 +1,214 @@
+---
+title: "542 Project"
+author: "Yilun Fu"
+date: '2022-05-03'
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# load packages
+library(kohonen)
+library(ElemStatLearn)
+library(ggplot2)
+library(caret)
+library(xgboost)
+```
+
+```{r}
+train = read.csv("fashion-mnist_train.csv")
+test = read.csv("fashion-mnist_test.csv")
+train$label = as.factor(train$label)
+```
+
+## PCA
+
+Before we get into SOM, high dimension problem must be considered. The parameters are all on the same scale and evenly distributed between 0 and the max value of 255. So there is no need to scale them.
+
+```{r}
+train.pca = prcomp(train[,-1],  center = TRUE, scale. = FALSE)
+summ = summary(train.pca)
+#calculate cumulative total variance explained by each principal component
+var_explained = train.pca$sdev^2 / sum(train.pca$sdev^2)
+propor_pca = cumsum(train.pca$sdev^2/sum(train.pca$sdev^2))
+n_pca = sum(propor_pca<0.98)+1
+
+#create scree plot
+qplot(c(1:784), var_explained) + 
+  geom_line() + 
+  xlab("Principal Component") + 
+  ylab("Variance Explained") +
+  ggtitle("Scree Plot")
+```
+
+```{r}
+PCs = c("PC1","PC5","PC10","PC30","PC100","PC200","PC300","PC400")
+var_pors = c(propor_pca[1],propor_pca[5],propor_pca[10],propor_pca[30],propor_pca[100],propor_pca[200],propor_pca[300],propor_pca[400])
+tab = cbind(PCs,var_pors)
+colnames(tab) = c('PC','Cumulative explained variance')
+knitr::kable(tab)
+```
+
+Choose 349 Pcs which explain over 98% of the total variance.
+
+
+
+```{r}
+# create new dataset based on PCs
+train_data_pca = data.frame(train.pca$x)[,1:349]
+train_data_pca$class = train[,1]
+# calculate the test data from PCA
+test_new = predict(train.pca,test[,-1])
+test_new = as.data.frame(test_new)[,1:349]
+test_new$class = test[,1]
+```
+
+## Self-Organising Maps
+
+The advantages using SOM are easy to explain the result with the maps and we can visualize high-dimensional data by two-dimensional maps.
+
+```{r}
+train.SOM = som(as.matrix(train_data_pca[1:349]), grid = somgrid(10, 10, "rectangular"))
+```
+
+### Counts plot
+
+We could identify observations with cells on the map by assigning each observation to the cell with representative vector closest to that data point’s stat line. The “count” type SOM does exactly this, and creates a heatmap based on the number of players assigned to each cell.
+
+So it can help us to Visualise the count of how many samples are mapped to each unit on the map. This metric can also be used as a measure of map quality. Large values in some map areas suggests that a larger map would be benificial. Empty nodes indicate that your map size is too big for the number of samples.
+
+
+
+```{r}
+plot(train.SOM, type = "counts")
+```
+
+### Mapping Distance
+
+The cells are colored depending on the overall distance to their nearest neighbors, which allows us to visualize how far apart different features are in the higher dimensional space.
+
+```{r}
+plot(train.SOM, type = "dist.neighbours")
+```
+
+## Classification Supervised Learning
+
+```{r}
+set.seed(1)
+train.SOM2 = xyf(as.matrix(train_data_pca[1:349]), classvec2classmat(train_data_pca[,350]),grid = somgrid(10, 10, "hexagonal"), rlen = 300)
+```
+
+Plotting using type = "codes" we get the standard side by side visualization the observation stats (Codes X) and the observation position prediction (Codes Y).
+
+```{r}
+par(mfrow = c(1, 2))
+plot(train.SOM2, type = "codes", main = c("Codes X", "Codes Y"))
+
+## Cluster Boundaries
+## use hierarchical clustering to cluster the codebook vectors
+train.SOM2.hc = cutree(hclust(dist(train.SOM2$codes[[2]])), 10)
+add.cluster.boundaries(train.SOM2, train.SOM2.hc)
+```
+We cannot see a clear plot for the left one since we have too many principle components or pixels here. If we have only several pixels then the plot of codebook vectors corresponding to X will generate a great plot to visualize which Pcs or pixels play in a important role in a specific cluster.
+
+The plot on the right provides a view with respect to y. Remember we used 100 clusters at the beginning so there are totally 100 circles. To get the cluster boundaries, hierarchical clustering is used to cluster the codebook vectors into 10 different classes in accordance with having 10 classes of Fashion-MNIST dataset.
+In more details, distance matrix are computed at the codebook y vectors' level with respect to clusters(100 in toal) and followed by hierarchical clustering. The colors in the plot are all about different classes set to clusters. So as a conclusion, roughly 14 clusters are merged from 100 clusters from the plot. One thing that need to be mentioned is the labels on the plot of Codes Y represent the true class for each cluster(1-100).
+
+
+```{r}
+# code y from SOM2 using xyf for each row they sum up to 1
+code_y_SOM2 = train.SOM2$codes[[2]]
+
+# pick the largest y code from each row as the class for each cluster
+# belongs to which class for each cluster(1-100)
+SOM2_code_y_class = apply(code_y_SOM2, 1, which.max)
+
+# predict with test data
+pred_test = predict(train.SOM2, newdata = as.matrix(test_new[,1:349]), whatmap = 1)
+pred_testclass = pred$predictions[[2]]
+conf_mat = confusionMatrix(pred_testclass, factor(test[,1]))
+print(conf_mat)
+```
+
+
+## Gradient Boost
+
+```{r}
+library(gbm)
+library(caret)
+model_gbm = gbm(label ~.,
+              data = train[1:300,],
+              distribution = "multinomial",
+              cv.folds = 10,
+              shrinkage = .01,
+              n.minobsinnode = 10,
+              n.trees = 500)  
+#use model to make predictions on test data
+pred_test_gbm = predict.gbm(object = model_gbm,
+                   newdata = test,
+                   n.trees = 500,           # 500 tress to be built
+                   type = "response")
+
+class_names = colnames(pred_test)[apply(pred_test, 1, which.max)]
+
+conf_mat = confusionMatrix(factor(test$label), factor(class_names))
+print(conf_mat)
+class(class_names)
+
+```
+
+```{r}
+train$label
+as.numeric(train_data_pca$class)
+
+label_new = as.matrix(as.numeric(train_data_pca$class))-1
+# use XGBOOST
+
+mod_xgb = xgboost(data = as.matrix(train_data_pca[,1:349]), label = as.matrix(train$label), eta = 1, nthread = 2, nrounds = 500, objective = "multi:softmax",num_class = 10)
+pred_xbg = predict(mod_xgb,as.matrix(test_new[,1:349]))
+conf_mat = confusionMatrix(factor(test$label), factor(pred_xbg))
+print(conf_mat)
+```
+
+
+
+
+
+
+```{r}
+mean(model_gbm$train.error)
+```
+
+
+
+```{r}
+# knn
+set.seed(1)
+cv_5 = trainControl(method = 'cv', number = 5)
+
+hd_knn_tune = expand.grid(
+  k = 1:10
+)
+
+hd_knn_mod = train(
+      form = class ~ .,
+      data = train_data_pca,
+      method = 'knn',
+      trControl = cv_5,
+      tuneGrid = hd_knn_tune
+      )
+preds = predict(hd_knn_mod,test_new)
+conf_mat = confusionMatrix(factor(test_new$class), factor(preds))
+print(conf_mat)
+
+hd_knn_mod
+
+```
+
+
+
+
+
